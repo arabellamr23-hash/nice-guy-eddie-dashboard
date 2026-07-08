@@ -111,6 +111,35 @@ function parseXeroPL(rep) {
   return { revenue: revenue, cogs: cogs, wagesSuper: wagesSuper, overheads: overheads };
 }
 
+/* ---- Timezone helpers (used by the POS adapter for trading-day boundaries) ----
+   localToUTC turns a wall-clock date (in the venue tz, at the rollover hour)
+   into the exact UTC instant, honouring DST. addDays shifts a YYYY-MM-DD. */
+function tzOffsetMs(tz, at) {
+  const dtf = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const p = {}; for (const part of dtf.formatToParts(at)) p[part.type] = part.value;
+  const hh = p.hour === '24' ? '00' : p.hour;
+  const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, +hh, +p.minute, +p.second);
+  return asUTC - at.getTime();
+}
+function localToUTC(tz, ymd, hour) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const h = hour || 0;
+  const guess = Date.UTC(y, m - 1, d, h, 0, 0);
+  let off = tzOffsetMs(tz, new Date(guess));
+  let utc = guess - off;
+  off = tzOffsetMs(tz, new Date(utc));
+  utc = guess - off;
+  return new Date(utc);
+}
+function addDays(ymd, n) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + n);
+  return dt.toISOString().slice(0, 10);
+}
+
 const ADAPTERS = {
 
   /* >>> ADAPTER 1: ACCOUNTING (connect this FIRST - it feeds most of the board)
@@ -216,12 +245,95 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
-    auth: null,
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+
+    _headers(env) {
+      return {
+        'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''),
+        'Square-Version': '2026-05-20',
+        'Content-Type': 'application/json'
+      };
+    },
+
+    async _locations(env, h) {
+      const cached = await env.TOKENS.get('square:locations');
+      if (cached) { try { return JSON.parse(cached); } catch (e) {} }
+      const data = await h.fetchJson('https://connect.squareup.com/v2/locations',
+        { headers: this._headers(env) }, { auth: false });
+      const locs = (data.locations || [])
+        .filter((l) => l.status === 'ACTIVE')
+        .map((l) => ({ id: l.id, name: l.name, tz: l.timezone }));
+      await env.TOKENS.put('square:locations', JSON.stringify(locs), { expirationTtl: 3600 });
+      return locs;
+    },
+
+    async status(env, h) {
+      if (!env.POS_API_TOKEN) return { connected: false };
+      const locs = await this._locations(env, h);
+      const name = locs.map((l) => l.name).filter(Boolean).join(', ');
+      return { connected: locs.length > 0, org: name || null, sandbox: false, lastSync: null };
+    },
+
+    /* Count COMPLETED orders (one order = one transaction/bill) whose created_at
+       falls in [startAt, endAt). Voids/cancels are CANCELED (excluded); refunds
+       do not change an order's COMPLETED state, so they never reduce the count.
+       Never returns a dollar figure. */
+    async _count(env, h, startAt, endAt, locationIds) {
+      let cursor = null, total = 0, guard = 0;
+      do {
+        const body = {
+          location_ids: locationIds,
+          limit: 500,
+          query: {
+            filter: {
+              date_time_filter: { created_at: { start_at: startAt, end_at: endAt } },
+              state_filter: { states: ['COMPLETED'] }
+            },
+            sort: { sort_field: 'CREATED_AT', sort_order: 'ASC' }
+          }
+        };
+        if (cursor) body.cursor = cursor;
+        const data = await h.fetchJson('https://connect.squareup.com/v2/orders/search',
+          { method: 'POST', headers: this._headers(env), body: JSON.stringify(body) },
+          { auth: false });
+        total += (data.orders || []).length;
+        cursor = data.cursor || null;
+        guard++;
+      } while (cursor && guard < 300);
+      return total;
+    },
+
+    async fetchRange(env, h, q) {
+      const locs = await this._locations(env, h);
+      const ids = locs.map((l) => l.id);
+      if (!ids.length) return { count: 0 };
+      const startAt = localToUTC(q.tz, q.from, q.rollover).toISOString();
+      const endAt = localToUTC(q.tz, addDays(q.to, 1), q.rollover).toISOString();
+      return { count: await this._count(env, h, startAt, endAt, ids) };
+    },
+
+    async fetchMonthly(env, h, q) {
+      const locs = await this._locations(env, h);
+      const ids = locs.map((l) => l.id);
+      const months = monthList(q.fromMonth, q.toMonth);
+      const out = { months: months, count: [] };
+      if (!ids.length) { out.count = months.map(() => null); return out; }
+      for (const m of months) {
+        const [y, mo] = m.split('-').map(Number);
+        const first = m + '-01';
+        const nextFirst = (mo === 12)
+          ? ((y + 1) + '-01-01')
+          : (y + '-' + String(mo + 1).padStart(2, '0') + '-01');
+        try {
+          const startAt = localToUTC(q.tz, first, q.rollover).toISOString();
+          const endAt = localToUTC(q.tz, nextFirst, q.rollover).toISOString();
+          out.count.push(await this._count(env, h, startAt, endAt, ids));
+        } catch (e) { out.count.push(null); }
+      }
+      return out;
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
