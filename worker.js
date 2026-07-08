@@ -56,6 +56,61 @@ import dashboardHtml from './dashboard.html';
    email() handler at the bottom (needs the owner's domain on their Cloudflare
    with Email Routing pointed at this Worker). Ingest auth: the INGEST_TOKEN
    secret; if the owner uploads by hand, that same value is their upload code. */
+/* ---------------- Xero P&L parsing (accounting adapter) ------------------
+   Revenue = Income / Trading Income section total (Other Income excluded).
+   COGS = Cost of Sales section total. Wages+super = lines within Operating
+   Expenses whose label matches the wage keywords. Overheads = Operating
+   Expenses total minus wages+super. All ex-GST (the P&L report is ex-tax). */
+function xeroNum(s) {
+  if (s == null) return 0;
+  let str = String(s).trim().replace(/,/g, '');
+  let neg = false;
+  if (/^\(.*\)$/.test(str)) { neg = true; str = str.replace(/[()]/g, ''); }
+  const n = parseFloat(str);
+  if (!isFinite(n)) return 0;
+  return neg ? -n : n;
+}
+const XERO_WAGE_RE = /wages|salaries|superannuation|super|payroll|annual leave|long service|workcover/i;
+function xeroRowAmount(cells) {
+  if (!Array.isArray(cells) || cells.length < 2) return 0;
+  const last = cells[cells.length - 1];
+  return xeroNum(last && last.Value);
+}
+function xeroRowLabel(cells) {
+  return (Array.isArray(cells) && cells[0] && cells[0].Value) || '';
+}
+function xeroSectionTotal(section) {
+  const rows = (section && section.Rows) || [];
+  for (const r of rows) if (r.RowType === 'SummaryRow') return xeroRowAmount(r.Cells);
+  let s = 0;
+  for (const r of rows) if (r.RowType === 'Row') s += xeroRowAmount(r.Cells);
+  return s;
+}
+function parseXeroPL(rep) {
+  const report = rep && rep.Reports && rep.Reports[0];
+  const rows = (report && report.Rows) || [];
+  let revenue = 0, cogs = 0, wagesSuper = 0, opExTotal = 0;
+  for (const sec of rows) {
+    if (sec.RowType !== 'Section') continue;
+    const title = (sec.Title || '').toLowerCase();
+    if (/other income/.test(title)) continue;                 // excluded from Revenue
+    if (/cost of sales|cost of goods|cogs/.test(title)) {
+      cogs += xeroSectionTotal(sec);
+    } else if (/operating expense|overhead|expense/.test(title)) {
+      opExTotal += xeroSectionTotal(sec);
+      for (const r of (sec.Rows || [])) {
+        if (r.RowType === 'Row' && XERO_WAGE_RE.test(xeroRowLabel(r.Cells))) {
+          wagesSuper += xeroRowAmount(r.Cells);
+        }
+      }
+    } else if (/income|revenue/.test(title)) {
+      revenue += xeroSectionTotal(sec);
+    }
+  }
+  const overheads = opExTotal - wagesSuper;
+  return { revenue: revenue, cogs: cogs, wagesSuper: wagesSuper, overheads: overheads };
+}
+
 const ADAPTERS = {
 
   /* >>> ADAPTER 1: ACCOUNTING (connect this FIRST - it feeds most of the board)
@@ -79,23 +134,73 @@ const ADAPTERS = {
      'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
   */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
+    configured: true,
+    auth: 'oauth',
     oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+      authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
+      tokenUrl: 'https://identity.xero.com/connect/token',
+      scopes: 'offline_access accounting.reports.profitandloss.read',
+      clientIdSecret: 'ACCOUNTING_CLIENT_ID',
+      clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
+      tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+
+    /* Resolve the Xero organisation (tenant) for the connected token. Cached in
+       KV so /connections isn't hit on every metric call. */
+    async _tenant(env, h) {
+      const cached = await env.TOKENS.get('xero:tenant');
+      if (cached) { try { return JSON.parse(cached); } catch (e) {} }
+      const conns = await h.fetchJson('https://api.xero.com/connections');
+      const list = Array.isArray(conns) ? conns.filter((c) => c.tenantType === 'ORGANISATION') : [];
+      if (!list.length) { const e = new Error('no tenant'); e.status = 401; throw e; }
+      const t = { id: list[0].tenantId, name: list[0].tenantName || '' };
+      await env.TOKENS.put('xero:tenant', JSON.stringify(t), { expirationTtl: 3600 });
+      return t;
+    },
+
+    async status(env, h) {
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.access_token) return { connected: false };
+      const t = await this._tenant(env, h);
+      return {
+        connected: true,
+        org: t.name,
+        sandbox: /demo company/i.test(t.name),
+        lastSync: null
+      };
+    },
+
+    async _pAndL(env, h, from, to) {
+      const t = await this._tenant(env, h);
+      const url = 'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?fromDate=' + from + '&toDate=' + to;
+      const rep = await h.fetchJson(url, { headers: { 'Xero-Tenant-Id': t.id, 'Accept': 'application/json' } });
+      return parseXeroPL(rep);
+    },
+
+    async fetchRange(env, h, q) {
+      return this._pAndL(env, h, q.from, q.to);
+    },
+
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const out = { months: months, revenue: [], cogs: [], wagesSuper: [], overheads: [] };
+      for (const m of months) {
+        const [y, mo] = m.split('-').map(Number);
+        const from = m + '-01';
+        const to = m + '-' + String(new Date(Date.UTC(y, mo, 0)).getUTCDate()).padStart(2, '0');
+        try {
+          const r = await this._pAndL(env, h, from, to);
+          out.revenue.push(r.revenue); out.cogs.push(r.cogs);
+          out.wagesSuper.push(r.wagesSuper); out.overheads.push(r.overheads);
+        } catch (e) {
+          out.revenue.push(null); out.cogs.push(null);
+          out.wagesSuper.push(null); out.overheads.push(null);
+        }
+      }
+      return out;
+    }
   },
+
 
   /* >>> ADAPTER 2: POS
      Contract:
