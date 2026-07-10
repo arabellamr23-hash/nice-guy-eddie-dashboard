@@ -56,11 +56,37 @@ import dashboardHtml from './dashboard.html';
    email() handler at the bottom (needs the owner's domain on their Cloudflare
    with Email Routing pointed at this Worker). Ingest auth: the INGEST_TOKEN
    secret; if the owner uploads by hand, that same value is their upload code. */
-/* ---------------- Xero P&L parsing (accounting adapter) ------------------
-   Revenue = Income / Trading Income section total (Other Income excluded).
-   COGS = Cost of Sales section total. Wages+super = lines within Operating
-   Expenses whose label matches the wage keywords. Overheads = Operating
-   Expenses total minus wages+super. All ex-GST (the P&L report is ex-tax). */
+/* ---- Timezone helpers (POS trading-day boundaries; DST-aware) ---- */
+function tzOffsetMs(tz, at) {
+  const dtf = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const p = {}; for (const part of dtf.formatToParts(at)) p[part.type] = part.value;
+  const hh = p.hour === '24' ? '00' : p.hour;
+  const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, +hh, +p.minute, +p.second);
+  return asUTC - at.getTime();
+}
+function localToUTC(tz, ymd, hour) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const h = hour || 0;
+  const guess = Date.UTC(y, m - 1, d, h, 0, 0);
+  let off = tzOffsetMs(tz, new Date(guess));
+  let utc = guess - off;
+  off = tzOffsetMs(tz, new Date(utc));
+  utc = guess - off;
+  return new Date(utc);
+}
+function addDays(ymd, n) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + n);
+  return dt.toISOString().slice(0, 10);
+}
+
+/* ---- Xero P&L parsing (accounting adapter) ----
+   Revenue = Income/Trading Income section total (Other Income excluded).
+   COGS = Cost of Sales section total. Wages+super = matched lines within
+   Operating Expenses. Overheads = Operating Expenses total minus wages+super. */
 function xeroNum(s) {
   if (s == null) return 0;
   let str = String(s).trim().replace(/,/g, '');
@@ -93,7 +119,7 @@ function parseXeroPL(rep) {
   for (const sec of rows) {
     if (sec.RowType !== 'Section') continue;
     const title = (sec.Title || '').toLowerCase();
-    if (/other income/.test(title)) continue;                 // excluded from Revenue
+    if (/other income/.test(title)) continue;
     if (/cost of sales|cost of goods|cogs/.test(title)) {
       cogs += xeroSectionTotal(sec);
     } else if (/operating expense|overhead|expense/.test(title)) {
@@ -110,36 +136,6 @@ function parseXeroPL(rep) {
   const overheads = opExTotal - wagesSuper;
   return { revenue: revenue, cogs: cogs, wagesSuper: wagesSuper, overheads: overheads };
 }
-
-/* ---- Timezone helpers (used by the POS adapter for trading-day boundaries) ----
-   localToUTC turns a wall-clock date (in the venue tz, at the rollover hour)
-   into the exact UTC instant, honouring DST. addDays shifts a YYYY-MM-DD. */
-function tzOffsetMs(tz, at) {
-  const dtf = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: false,
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  const p = {}; for (const part of dtf.formatToParts(at)) p[part.type] = part.value;
-  const hh = p.hour === '24' ? '00' : p.hour;
-  const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, +hh, +p.minute, +p.second);
-  return asUTC - at.getTime();
-}
-function localToUTC(tz, ymd, hour) {
-  const [y, m, d] = ymd.split('-').map(Number);
-  const h = hour || 0;
-  const guess = Date.UTC(y, m - 1, d, h, 0, 0);
-  let off = tzOffsetMs(tz, new Date(guess));
-  let utc = guess - off;
-  off = tzOffsetMs(tz, new Date(utc));
-  utc = guess - off;
-  return new Date(utc);
-}
-function addDays(ymd, n) {
-  const [y, m, d] = ymd.split('-').map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  dt.setUTCDate(dt.getUTCDate() + n);
-  return dt.toISOString().slice(0, 10);
-}
-
 
 const ADAPTERS = {
 
@@ -172,15 +168,10 @@ const ADAPTERS = {
       scopes: 'offline_access accounting.reports.profitandloss.read',
       clientIdSecret: 'ACCOUNTING_CLIENT_ID',
       clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-      tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
+      tokenAuth: 'basic'
     },
 
-    /* Resolve the Xero organisation (tenant) for the connected token. Cached in
-       KV so /connections isn't hit on every metric call. */
     async _tenant(env, h) {
-      /* A Xero login can grant access to several organisations. Pin the venue's
-         org (env.ACCOUNTING_TENANT_ID, set in wrangler.toml) so the board can
-         never drift to another company's books. */
       const pinned = env.ACCOUNTING_TENANT_ID || (await env.TOKENS.get('xero:chosen_tenant_id'));
       const cached = await env.TOKENS.get('xero:tenant');
       if (cached) {
@@ -200,12 +191,7 @@ const ADAPTERS = {
       const tokens = await h.getTokens();
       if (!tokens || !tokens.access_token) return { connected: false };
       const t = await this._tenant(env, h);
-      return {
-        connected: true,
-        org: t.name,
-        sandbox: /demo company/i.test(t.name),
-        lastSync: null
-      };
+      return { connected: true, org: t.name, sandbox: /demo company/i.test(t.name), lastSync: null };
     },
 
     async _pAndL(env, h, from, to) {
@@ -239,7 +225,6 @@ const ADAPTERS = {
     }
   },
 
-
   /* >>> ADAPTER 2: POS
      Contract:
        status(env, h)        -> { connected, org, sandbox, lastSync }
@@ -278,8 +263,6 @@ const ADAPTERS = {
           .map((l) => ({ id: l.id, name: l.name, tz: l.timezone }));
         await env.TOKENS.put('square:locations', JSON.stringify(locs), { expirationTtl: 3600 });
       }
-      /* Pin the venue's location(s) so the count can never drift to another
-         venue on the same Square login. env.POS_LOCATION_IDS = comma-separated. */
       const pin = (env.POS_LOCATION_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
       if (pin.length) locs = locs.filter((l) => pin.includes(l.id));
       return locs;
@@ -292,11 +275,11 @@ const ADAPTERS = {
       return { connected: locs.length > 0, org: name || null, sandbox: false, lastSync: null };
     },
 
-    /* Count real transactions for the venue. COMPLETED orders are paid sales.
-       This venue also rings comped/discounted cash sales that Square leaves as
-       OPEN orders WITH a tender (a payment was rung) — those are real sales and
-       count too. Never-paid open tabs (no tender) and voids/cancels are excluded;
-       refunds never reduce the count. Never returns a dollar figure. */
+    /* Count real transactions. COMPLETED orders are paid sales. This venue also
+       rings comped/discounted cash sales that Square leaves as OPEN orders WITH a
+       tender (a payment was rung) - those are real sales and count too. Never-paid
+       open tabs (no tender) and voids/cancels are excluded; refunds never reduce
+       the count. Never returns a dollar figure. */
     async _count(env, h, startAt, endAt, locationIds) {
       let cursor = null, total = 0, guard = 0;
       do {
@@ -326,112 +309,6 @@ const ADAPTERS = {
     },
 
     async fetchRange(env, h, q) {
-      return this._pAndL(env, h, q.from, q.to);
-    },
-
-    async fetchMonthly(env, h, q) {
-      const months = monthList(q.fromMonth, q.toMonth);
-      const out = { months: months, revenue: [], cogs: [], wagesSuper: [], overheads: [] };
-      for (const m of months) {
-        const [y, mo] = m.split('-').map(Number);
-        const from = m + '-01';
-        const to = m + '-' + String(new Date(Date.UTC(y, mo, 0)).getUTCDate()).padStart(2, '0');
-        try {
-          const r = await this._pAndL(env, h, from, to);
-          out.revenue.push(r.revenue); out.cogs.push(r.cogs);
-          out.wagesSuper.push(r.wagesSuper); out.overheads.push(r.overheads);
-        } catch (e) {
-          out.revenue.push(null); out.cogs.push(null);
-          out.wagesSuper.push(null); out.overheads.push(null);
-        }
-      }
-      return out;
-    }
-  },
-
-
-  /* >>> ADAPTER 2: POS
-     Contract:
-       status(env, h)        -> { connected, org, sandbox, lastSync }
-       fetchRange(env, h, q) -> { count }   (completed transactions only;
-                                  exclude voided/cancelled; refunds never
-                                  reduce the count; q.rollover shifts the
-                                  trading-day boundary by that many hours)
-       fetchMonthly(env, h, q)-> { months:[...], count:[...] }
-     NEVER return a dollar figure from the POS.
-     Example (Square): pasted production personal access token (secret
-     POS_API_TOKEN); sandbox sign = token only answers on
-     connect.squareupsandbox.com.
-  */
-  pos: {
-    configured: true,
-    auth: 'token',
-    oauth: {},
-
-    _headers(env) {
-      return {
-        'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''),
-        'Square-Version': '2026-05-20',
-        'Content-Type': 'application/json'
-      };
-    },
-
-    async _locations(env, h) {
-      let locs = null;
-      const cached = await env.TOKENS.get('square:locations');
-      if (cached) { try { locs = JSON.parse(cached); } catch (e) {} }
-      if (!locs) {
-        const data = await h.fetchJson('https://connect.squareup.com/v2/locations',
-          { headers: this._headers(env) }, { auth: false });
-        locs = (data.locations || [])
-          .filter((l) => l.status === 'ACTIVE')
-          .map((l) => ({ id: l.id, name: l.name, tz: l.timezone }));
-        await env.TOKENS.put('square:locations', JSON.stringify(locs), { expirationTtl: 3600 });
-      }
-      /* Pin the venue's location(s) so the count can never drift to another
-         venue on the same Square login. env.POS_LOCATION_IDS = comma-separated. */
-      const pin = (env.POS_LOCATION_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
-      if (pin.length) locs = locs.filter((l) => pin.includes(l.id));
-      return locs;
-    },
-
-    async status(env, h) {
-      if (!env.POS_API_TOKEN) return { connected: false };
-      const locs = await this._locations(env, h);
-      const name = locs.map((l) => l.name).filter(Boolean).join(', ');
-      return { connected: locs.length > 0, org: name || null, sandbox: false, lastSync: null };
-    },
-
-    /* Count COMPLETED orders (one order = one transaction/bill) whose created_at
-       falls in [startAt, endAt). Voids/cancels are CANCELED (excluded); refunds
-       do not change an order's COMPLETED state, so they never reduce the count.
-       Never returns a dollar figure. */
-    async _count(env, h, startAt, endAt, locationIds) {
-      let cursor = null, total = 0, guard = 0;
-      do {
-        const body = {
-          location_ids: locationIds,
-          limit: 500,
-          query: {
-            filter: {
-              date_time_filter: { created_at: { start_at: startAt, end_at: endAt } },
-              state_filter: { states: ['COMPLETED'] }
-            },
-            sort: { sort_field: 'CREATED_AT', sort_order: 'ASC' }
-          }
-        };
-        if (cursor) body.cursor = cursor;
-        const data = await h.fetchJson('https://connect.squareup.com/v2/orders/search',
-          { method: 'POST', headers: this._headers(env), body: JSON.stringify(body) },
-          { auth: false });
-        total += (data.orders || []).length;
-        cursor = data.cursor || null;
-        guard++;
-      } while (cursor && guard < 300);
-      return total;
-    },
-
-    async fetchRange(env, h, q) {
       const locs = await this._locations(env, h);
       const ids = locs.map((l) => l.id);
       if (!ids.length) return { count: 0 };
@@ -449,9 +326,7 @@ const ADAPTERS = {
       for (const m of months) {
         const [y, mo] = m.split('-').map(Number);
         const first = m + '-01';
-        const nextFirst = (mo === 12)
-          ? ((y + 1) + '-01-01')
-          : (y + '-' + String(mo + 1).padStart(2, '0') + '-01');
+        const nextFirst = (mo === 12) ? ((y + 1) + '-01-01') : (y + '-' + String(mo + 1).padStart(2, '0') + '-01');
         try {
           const startAt = localToUTC(q.tz, first, q.rollover).toISOString();
           const endAt = localToUTC(q.tz, nextFirst, q.rollover).toISOString();
