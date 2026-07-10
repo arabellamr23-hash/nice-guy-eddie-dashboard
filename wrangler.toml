@@ -62,8 +62,7 @@ id = "17c5232a3cbc4c7ab31b39d1cd52335b"
 # ----------------------------------------------------------------------------
 # Cron rung (only when an adapter uses scheduledPull to fetch a tool's own
 # export on a schedule). Uncomment and set a sensible cadence:
-# [triggers]
-# crons = ["0 3 * * *"]   # daily, 3am UTC - adjust to land after the tool's
-#                          # own export runs
+[triggers]
+crons = ["0 */6 * * *"]   # every 6h: warm the month caches so page loads are fast
 # ----------------------------------------------------------------------------
 # EOF wrangler.toml

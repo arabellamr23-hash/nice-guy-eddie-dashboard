@@ -146,6 +146,16 @@ function parseXeroPL(rep) {
   return { revenue: revenue, cogs: cogs, wagesSuper: wagesSuper, overheads: overheads };
 }
 
+/* True if [from,to] is exactly one calendar month (1st .. last day) -> 'YYYY-MM'. */
+function monthAligned(from, to) {
+  const m = /^(\d{4})-(\d{2})-01$/.exec(from || '');
+  if (!m) return null;
+  const y = +m[1], mo = +m[2];
+  const lastDay = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  const expectedTo = m[1] + '-' + m[2] + '-' + String(lastDay).padStart(2, '0');
+  return (to === expectedTo) ? (m[1] + '-' + m[2]) : null;
+}
+
 const ADAPTERS = {
 
   /* >>> ADAPTER 1: ACCOUNTING (connect this FIRST - it feeds most of the board)
@@ -210,7 +220,23 @@ const ADAPTERS = {
       return parseXeroPL(rep);
     },
 
+    /* Cache a whole month's P&L in KV. Past months change rarely, so cache them
+       12h; the current month 1h. Slashes repeat/period-switch cost. */
+    async _monthPL(env, h, ym) {
+      const nowd = new Date(); const curKey = nowd.getUTCFullYear() + '-' + String(nowd.getUTCMonth() + 1).padStart(2, '0');
+      const past = ym < curKey; const key = 'plmonth:' + ym;
+      if (past) { const c = await env.TOKENS.get(key); if (c) { try { return JSON.parse(c); } catch (e) {} } }
+      const [y, mo] = ym.split('-').map(Number);
+      const first = ym + '-01';
+      const last = ym + '-' + String(new Date(Date.UTC(y, mo, 0)).getUTCDate()).padStart(2, '0');
+      const r = await this._pAndL(env, h, first, last);
+      await env.TOKENS.put(key, JSON.stringify(r), { expirationTtl: past ? 43200 : 3600 });
+      return r;
+    },
+
     async fetchRange(env, h, q) {
+      const ym = monthAligned(q.from, q.to);
+      if (ym) return this._monthPL(env, h, ym);
       return this._pAndL(env, h, q.from, q.to);
     },
 
@@ -218,11 +244,8 @@ const ADAPTERS = {
       const months = monthList(q.fromMonth, q.toMonth);
       const out = { months: months, revenue: [], cogs: [], wagesSuper: [], overheads: [] };
       for (const m of months) {
-        const [y, mo] = m.split('-').map(Number);
-        const from = m + '-01';
-        const to = m + '-' + String(new Date(Date.UTC(y, mo, 0)).getUTCDate()).padStart(2, '0');
         try {
-          const r = await this._pAndL(env, h, from, to);
+          const r = await this._monthPL(env, h, m);
           out.revenue.push(r.revenue); out.cogs.push(r.cogs);
           out.wagesSuper.push(r.wagesSuper); out.overheads.push(r.overheads);
         } catch (e) {
@@ -317,10 +340,29 @@ const ADAPTERS = {
       return total;
     },
 
+    /* Cache a whole month's completed-transaction count in KV (keyed by tz +
+       rollover). Counting a month of Square orders is the slow part; past months
+       cache 24h, the current month 1h. */
+    async _monthCount(env, h, ids, tz, rollover, ym) {
+      const nowd = new Date(); const curKey = nowd.getUTCFullYear() + '-' + String(nowd.getUTCMonth() + 1).padStart(2, '0');
+      const past = ym < curKey; const key = 'poscount:' + tz + ':' + rollover + ':' + ym;
+      if (past) { const c = await env.TOKENS.get(key); if (c != null) { const n = parseInt(c, 10); if (isFinite(n)) return n; } }
+      const [y, mo] = ym.split('-').map(Number);
+      const first = ym + '-01';
+      const nextFirst = (mo === 12) ? ((y + 1) + '-01-01') : (y + '-' + String(mo + 1).padStart(2, '0') + '-01');
+      const startAt = localToUTC(tz, first, rollover).toISOString();
+      const endAt = localToUTC(tz, nextFirst, rollover).toISOString();
+      const cnt = await this._count(env, h, startAt, endAt, ids);
+      await env.TOKENS.put(key, String(cnt), { expirationTtl: past ? 86400 : 3600 });
+      return cnt;
+    },
+
     async fetchRange(env, h, q) {
       const locs = await this._locations(env, h);
       const ids = locs.map((l) => l.id);
       if (!ids.length) return { count: 0 };
+      const ym = monthAligned(q.from, q.to);
+      if (ym) return { count: await this._monthCount(env, h, ids, q.tz, q.rollover, ym) };
       const startAt = localToUTC(q.tz, q.from, q.rollover).toISOString();
       const endAt = localToUTC(q.tz, addDays(q.to, 1), q.rollover).toISOString();
       return { count: await this._count(env, h, startAt, endAt, ids) };
@@ -333,14 +375,8 @@ const ADAPTERS = {
       const out = { months: months, count: [] };
       if (!ids.length) { out.count = months.map(() => null); return out; }
       for (const m of months) {
-        const [y, mo] = m.split('-').map(Number);
-        const first = m + '-01';
-        const nextFirst = (mo === 12) ? ((y + 1) + '-01-01') : (y + '-' + String(mo + 1).padStart(2, '0') + '-01');
-        try {
-          const startAt = localToUTC(q.tz, first, q.rollover).toISOString();
-          const endAt = localToUTC(q.tz, nextFirst, q.rollover).toISOString();
-          out.count.push(await this._count(env, h, startAt, endAt, ids));
-        } catch (e) { out.count.push(null); }
+        try { out.count.push(await this._monthCount(env, h, ids, q.tz, q.rollover, m)); }
+        catch (e) { out.count.push(null); }
       }
       return out;
     }
@@ -882,7 +918,7 @@ async function fetchSlot(env, q) {
   return out;
 }
 
-const METRICS_CACHE_TTL = 120; /* seconds: brief cache for live provider data */
+const METRICS_CACHE_TTL = 600; /* seconds: brief cache for live provider data */
 
 async function apiMetrics(env, url) {
   const cur = parseRange(url.searchParams.get('cur'));
@@ -1047,15 +1083,26 @@ export default {
   /* Cron rung: uncomment [triggers] in wrangler.toml and give any adapter a
      scheduledPull() to fetch its tool's own export on a schedule. */
   async scheduled(event, env, ctx) {
+    /* Warm the month caches so user page loads are fast (never a cold 12-month
+       recompute in front of the owner). Last 13 months, current tz defaults. */
+    try {
+      const tz = 'Australia/Sydney', rollover = 0;
+      const now = new Date();
+      const months = [];
+      for (let i = 0; i < 13; i++) { const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1)); months.push(d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0')); }
+      const acc = ADAPTERS.accounting, pos = ADAPTERS.pos;
+      const ha = makeHelpers(env, 'accounting');
+      for (const m of months) { try { await acc._monthPL(env, ha, m); } catch (e) {} }
+      const hp = makeHelpers(env, 'pos');
+      let ids = [];
+      try { ids = (await pos._locations(env, hp)).map((l) => l.id); } catch (e) {}
+      if (ids.length) { for (const m of months) { try { await pos._monthCount(env, hp, ids, tz, rollover, m); } catch (e) {} } }
+    } catch (e) { console.log('warm failed: ' + (e && e.message)); }
     for (const source of ['accounting', 'pos', 'rostering']) {
       const a = ADAPTERS[source];
       if (a && typeof a.scheduledPull === 'function') {
-        try {
-          await a.scheduledPull(env, makeHelpers(env, source));
-          await noteSync(env, source);
-        } catch (e) {
-          console.log('scheduledPull failed for ' + source + ': ' + (e && e.message));
-        }
+        try { await a.scheduledPull(env, makeHelpers(env, source)); await noteSync(env, source); }
+        catch (e) { console.log('scheduledPull failed for ' + source + ': ' + (e && e.message)); }
       }
     }
   },
