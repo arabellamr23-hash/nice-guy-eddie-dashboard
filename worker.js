@@ -1077,6 +1077,41 @@ export default {
         return json(out);
       } catch (e) { return json({ error: String(e && e.message) }, 500); }
     }
+    if (path === '/api/debug/breakdown' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      const from = url.searchParams.get('from') || '2026-06-01';
+      const to = url.searchParams.get('to') || '2026-06-30';
+      const h = makeHelpers(env, 'pos');
+      try {
+        const data = await h.fetchJson('https://connect.squareup.com/v2/locations',
+          { headers: ADAPTERS.pos._headers(env) }, { auth: false });
+        const active = (data.locations || []).find((l) => l.status === 'ACTIVE') || (data.locations || [])[0];
+        const loc = active.id; const tz = active.timezone || 'Australia/Sydney';
+        const startAt = localToUTC(tz, from, 0).toISOString();
+        const endAt = localToUTC(tz, addDays(to, 1), 0).toISOString();
+        let cursor = null, guard = 0;
+        let completed = 0, openZero = 0, openNonzero = 0, other = 0;
+        do {
+          const body = { location_ids: [loc], limit: 500,
+            query: { filter: { date_time_filter: { created_at: { start_at: startAt, end_at: endAt } },
+              state_filter: { states: ['COMPLETED', 'OPEN'] } },
+              sort: { sort_field: 'CREATED_AT', sort_order: 'ASC' } } };
+          if (cursor) body.cursor = cursor;
+          const d = await h.fetchJson('https://connect.squareup.com/v2/orders/search',
+            { method: 'POST', headers: ADAPTERS.pos._headers(env), body: JSON.stringify(body) }, { auth: false });
+          for (const o of (d.orders || [])) {
+            const tot = (o.total_money && o.total_money.amount) || 0;
+            if (o.state === 'COMPLETED') completed++;
+            else if (o.state === 'OPEN' && tot === 0) openZero++;
+            else if (o.state === 'OPEN') openNonzero++;
+            else other++;
+          }
+          cursor = d.cursor || null; guard++;
+        } while (cursor && guard < 400);
+        return json({ location: active.name, completed, open_zero: openZero, open_nonzero: openNonzero, other,
+          completed_plus_openzero: completed + openZero });
+      } catch (e) { return json({ error: String(e && e.message) }, 500); }
+    }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
       if (!loggedIn) return Response.redirect(url.origin + '/', 302);
