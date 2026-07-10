@@ -9,15 +9,15 @@ name = "nice-guy-eddie-dashboard"
 main = "worker.js"
 compatibility_date = "2026-06-01"
 
-# Pin the venue's Xero org and Square till so the board can never drift.
-[vars]
-ACCOUNTING_TENANT_ID = "bb4b85a3-3342-4b95-a50a-c4452534f098"
-POS_LOCATION_IDS = "L76SFH2HQPZHM"
-
 # The dashboard page is bundled into the Worker as text.
 rules = [
   { type = "Text", globs = ["**/*.html"], fallthrough = true }
 ]
+
+# Pin the venue's Xero org and Square till so the board can never drift.
+[vars]
+ACCOUNTING_TENANT_ID = "bb4b85a3-3342-4b95-a50a-c4452534f098"
+POS_LOCATION_IDS = "L76SFH2HQPZHM"
 
 # Token + session store (KV). Declared so the GitHub -> Cloudflare deploy
 # AUTO-PROVISIONS it: Cloudflare reads this binding, creates the namespace, and
