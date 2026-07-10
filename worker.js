@@ -140,33 +140,6 @@ function addDays(ymd, n) {
   return dt.toISOString().slice(0, 10);
 }
 
-/* Diagnostic count variants (used only by /api/debug/count). */
-async function dbgCountOrders(env, h, locId, startAt, endAt, dateField, states) {
-  let cursor = null, total = 0, guard = 0;
-  do {
-    const filter = { state_filter: { states: states } };
-    filter.date_time_filter = {}; filter.date_time_filter[dateField] = { start_at: startAt, end_at: endAt };
-    const body = { location_ids: [locId], limit: 500,
-      query: { filter, sort: { sort_field: dateField.toUpperCase(), sort_order: 'ASC' } } };
-    if (cursor) body.cursor = cursor;
-    const data = await h.fetchJson('https://connect.squareup.com/v2/orders/search',
-      { method: 'POST', headers: ADAPTERS.pos._headers(env), body: JSON.stringify(body) }, { auth: false });
-    total += (data.orders || []).length; cursor = data.cursor || null; guard++;
-  } while (cursor && guard < 400);
-  return total;
-}
-async function dbgCountPayments(env, h, locId, beginTime, endTime) {
-  let cursor = null, total = 0, guard = 0;
-  do {
-    let u = 'https://connect.squareup.com/v2/payments?begin_time=' + encodeURIComponent(beginTime)
-      + '&end_time=' + encodeURIComponent(endTime) + '&location_id=' + locId + '&limit=100&sort_order=ASC';
-    if (cursor) u += '&cursor=' + encodeURIComponent(cursor);
-    const data = await h.fetchJson(u, { headers: ADAPTERS.pos._headers(env) }, { auth: false });
-    total += (data.payments || []).filter((p) => p.status === 'COMPLETED').length;
-    cursor = data.cursor || null; guard++;
-  } while (cursor && guard < 800);
-  return total;
-}
 
 const ADAPTERS = {
 
@@ -240,6 +213,116 @@ const ADAPTERS = {
       const url = 'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?fromDate=' + from + '&toDate=' + to;
       const rep = await h.fetchJson(url, { headers: { 'Xero-Tenant-Id': t.id, 'Accept': 'application/json' } });
       return parseXeroPL(rep);
+    },
+
+    async fetchRange(env, h, q) {
+      return this._pAndL(env, h, q.from, q.to);
+    },
+
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const out = { months: months, revenue: [], cogs: [], wagesSuper: [], overheads: [] };
+      for (const m of months) {
+        const [y, mo] = m.split('-').map(Number);
+        const from = m + '-01';
+        const to = m + '-' + String(new Date(Date.UTC(y, mo, 0)).getUTCDate()).padStart(2, '0');
+        try {
+          const r = await this._pAndL(env, h, from, to);
+          out.revenue.push(r.revenue); out.cogs.push(r.cogs);
+          out.wagesSuper.push(r.wagesSuper); out.overheads.push(r.overheads);
+        } catch (e) {
+          out.revenue.push(null); out.cogs.push(null);
+          out.wagesSuper.push(null); out.overheads.push(null);
+        }
+      }
+      return out;
+    }
+  },
+
+
+  /* >>> ADAPTER 2: POS
+     Contract:
+       status(env, h)        -> { connected, org, sandbox, lastSync }
+       fetchRange(env, h, q) -> { count }   (completed transactions only;
+                                  exclude voided/cancelled; refunds never
+                                  reduce the count; q.rollover shifts the
+                                  trading-day boundary by that many hours)
+       fetchMonthly(env, h, q)-> { months:[...], count:[...] }
+     NEVER return a dollar figure from the POS.
+     Example (Square): pasted production personal access token (secret
+     POS_API_TOKEN); sandbox sign = token only answers on
+     connect.squareupsandbox.com.
+  */
+  pos: {
+    configured: true,
+    auth: 'token',
+    oauth: {},
+
+    _headers(env) {
+      return {
+        'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''),
+        'Square-Version': '2026-05-20',
+        'Content-Type': 'application/json'
+      };
+    },
+
+    async _locations(env, h) {
+      let locs = null;
+      const cached = await env.TOKENS.get('square:locations');
+      if (cached) { try { locs = JSON.parse(cached); } catch (e) {} }
+      if (!locs) {
+        const data = await h.fetchJson('https://connect.squareup.com/v2/locations',
+          { headers: this._headers(env) }, { auth: false });
+        locs = (data.locations || [])
+          .filter((l) => l.status === 'ACTIVE')
+          .map((l) => ({ id: l.id, name: l.name, tz: l.timezone }));
+        await env.TOKENS.put('square:locations', JSON.stringify(locs), { expirationTtl: 3600 });
+      }
+      /* Pin the venue's location(s) so the count can never drift to another
+         venue on the same Square login. env.POS_LOCATION_IDS = comma-separated. */
+      const pin = (env.POS_LOCATION_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
+      if (pin.length) locs = locs.filter((l) => pin.includes(l.id));
+      return locs;
+    },
+
+    async status(env, h) {
+      if (!env.POS_API_TOKEN) return { connected: false };
+      const locs = await this._locations(env, h);
+      const name = locs.map((l) => l.name).filter(Boolean).join(', ');
+      return { connected: locs.length > 0, org: name || null, sandbox: false, lastSync: null };
+    },
+
+    /* Count real transactions for the venue. COMPLETED orders are paid sales.
+       This venue also rings comped/discounted cash sales that Square leaves as
+       OPEN orders WITH a tender (a payment was rung) — those are real sales and
+       count too. Never-paid open tabs (no tender) and voids/cancels are excluded;
+       refunds never reduce the count. Never returns a dollar figure. */
+    async _count(env, h, startAt, endAt, locationIds) {
+      let cursor = null, total = 0, guard = 0;
+      do {
+        const body = {
+          location_ids: locationIds,
+          limit: 500,
+          query: {
+            filter: {
+              date_time_filter: { created_at: { start_at: startAt, end_at: endAt } },
+              state_filter: { states: ['COMPLETED', 'OPEN'] }
+            },
+            sort: { sort_field: 'CREATED_AT', sort_order: 'ASC' }
+          }
+        };
+        if (cursor) body.cursor = cursor;
+        const data = await h.fetchJson('https://connect.squareup.com/v2/orders/search',
+          { method: 'POST', headers: this._headers(env), body: JSON.stringify(body) },
+          { auth: false });
+        for (const o of (data.orders || [])) {
+          if (o.state === 'COMPLETED') total++;
+          else if (o.state === 'OPEN' && Array.isArray(o.tenders) && o.tenders.length > 0) total++;
+        }
+        cursor = data.cursor || null;
+        guard++;
+      } while (cursor && guard < 400);
+      return total;
     },
 
     async fetchRange(env, h, q) {
@@ -1015,105 +1098,6 @@ export default {
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
-    }
-    if (path === '/api/debug/entities' && request.method === 'GET') {
-      if (!loggedIn) return json({ error: 'auth' }, 401);
-      const from = url.searchParams.get('from') || '2026-06-01';
-      const to = url.searchParams.get('to') || '2026-06-30';
-      const result = { range: { from, to }, xero_orgs: [], square_locations: [] };
-      // Xero orgs
-      try {
-        const h = makeHelpers(env, 'accounting');
-        const conns = await h.fetchJson('https://api.xero.com/connections');
-        const list = Array.isArray(conns) ? conns.filter((c) => c.tenantType === 'ORGANISATION') : [];
-        for (const c of list) {
-          let rev = null, err = null;
-          try {
-            const rep = await h.fetchJson('https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?fromDate=' + from + '&toDate=' + to,
-              { headers: { 'Xero-Tenant-Id': c.tenantId, 'Accept': 'application/json' } });
-            rev = parseXeroPL(rep).revenue;
-          } catch (e) { err = String(e && e.message); }
-          result.xero_orgs.push({ name: c.tenantName, tenantId: c.tenantId, june_revenue: rev, error: err });
-        }
-      } catch (e) { result.xero_error = String(e && e.message); }
-      // Square locations
-      try {
-        const h = makeHelpers(env, 'pos');
-        const data = await h.fetchJson('https://connect.squareup.com/v2/locations',
-          { headers: ADAPTERS.pos._headers(env) }, { auth: false });
-        const tz = url.searchParams.get('tz') || 'Australia/Sydney';
-        const startAt = localToUTC(tz, from, 0).toISOString();
-        const endAt = localToUTC(tz, addDays(to, 1), 0).toISOString();
-        for (const l of (data.locations || [])) {
-          let cnt = null, err = null;
-          try { cnt = await ADAPTERS.pos._count(env, h, startAt, endAt, [l.id]); }
-          catch (e) { err = String(e && e.message); }
-          result.square_locations.push({ id: l.id, name: l.name, status: l.status, june_count: cnt, error: err });
-        }
-      } catch (e) { result.square_error = String(e && e.message); }
-      return json(result);
-    }
-    if (path === '/api/debug/count' && request.method === 'GET') {
-      if (!loggedIn) return json({ error: 'auth' }, 401);
-      const from = url.searchParams.get('from') || '2026-06-01';
-      const to = url.searchParams.get('to') || '2026-06-30';
-      const h = makeHelpers(env, 'pos');
-      try {
-        const data = await h.fetchJson('https://connect.squareup.com/v2/locations',
-          { headers: ADAPTERS.pos._headers(env) }, { auth: false });
-        const active = (data.locations || []).find((l) => l.status === 'ACTIVE') || (data.locations || [])[0];
-        const loc = active.id; const locTz = active.timezone || 'Australia/Sydney';
-        const startSyd = localToUTC('Australia/Sydney', from, 0).toISOString();
-        const endSyd = localToUTC('Australia/Sydney', addDays(to, 1), 0).toISOString();
-        const startLoc = localToUTC(locTz, from, 0).toISOString();
-        const endLoc = localToUTC(locTz, addDays(to, 1), 0).toISOString();
-        const out = { location: active.name, locId: loc, locTz: locTz };
-        out.created_completed_syd = await dbgCountOrders(env, h, loc, startSyd, endSyd, 'created_at', ['COMPLETED']);
-        out.created_completed_loc = await dbgCountOrders(env, h, loc, startLoc, endLoc, 'created_at', ['COMPLETED']);
-        out.closed_completed_loc  = await dbgCountOrders(env, h, loc, startLoc, endLoc, 'closed_at', ['COMPLETED']);
-        out.created_completed_open_loc = await dbgCountOrders(env, h, loc, startLoc, endLoc, 'created_at', ['COMPLETED', 'OPEN']);
-        try { out.payments_completed_loc = await dbgCountPayments(env, h, loc, startLoc, endLoc); }
-        catch (e) { out.payments_error = String(e && e.message); }
-        return json(out);
-      } catch (e) { return json({ error: String(e && e.message) }, 500); }
-    }
-    if (path === '/api/debug/breakdown' && request.method === 'GET') {
-      if (!loggedIn) return json({ error: 'auth' }, 401);
-      const from = url.searchParams.get('from') || '2026-06-01';
-      const to = url.searchParams.get('to') || '2026-06-30';
-      const h = makeHelpers(env, 'pos');
-      try {
-        const data = await h.fetchJson('https://connect.squareup.com/v2/locations',
-          { headers: ADAPTERS.pos._headers(env) }, { auth: false });
-        const active = (data.locations || []).find((l) => l.status === 'ACTIVE') || (data.locations || [])[0];
-        const loc = active.id; const tz = active.timezone || 'Australia/Sydney';
-        const startAt = localToUTC(tz, from, 0).toISOString();
-        const endAt = localToUTC(tz, addDays(to, 1), 0).toISOString();
-        let cursor = null, guard = 0;
-        let completed = 0, openTender = 0, openZero = 0, openNonzero = 0, other = 0;
-        do {
-          const body = { location_ids: [loc], limit: 500,
-            query: { filter: { date_time_filter: { created_at: { start_at: startAt, end_at: endAt } },
-              state_filter: { states: ['COMPLETED', 'OPEN'] } },
-              sort: { sort_field: 'CREATED_AT', sort_order: 'ASC' } } };
-          if (cursor) body.cursor = cursor;
-          const d = await h.fetchJson('https://connect.squareup.com/v2/orders/search',
-            { method: 'POST', headers: ADAPTERS.pos._headers(env), body: JSON.stringify(body) }, { auth: false });
-          for (const o of (d.orders || [])) {
-            const tot = (o.total_money && o.total_money.amount) || 0;
-            const hasTender = Array.isArray(o.tenders) && o.tenders.length > 0;
-            if (o.state === 'COMPLETED') completed++;
-            else if (o.state === 'OPEN' && hasTender) openTender++;
-            else if (o.state === 'OPEN' && tot === 0) openZero++;
-            else if (o.state === 'OPEN') openNonzero++;
-            else other++;
-          }
-          cursor = d.cursor || null; guard++;
-        } while (cursor && guard < 400);
-        return json({ location: active.name, completed, open_with_tender: openTender,
-          open_zero_no_tender: openZero, open_nonzero_no_tender: openNonzero, other,
-          completed_plus_open_tender: completed + openTender });
-      } catch (e) { return json({ error: String(e && e.message) }, 500); }
     }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
