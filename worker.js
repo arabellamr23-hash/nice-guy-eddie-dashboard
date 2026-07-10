@@ -974,6 +974,33 @@ export default {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
     }
+    if (path === '/api/debug/pl' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      const from = url.searchParams.get('from') || '2026-06-01';
+      const to = url.searchParams.get('to') || '2026-06-30';
+      try {
+        const h = makeHelpers(env, 'accounting');
+        const t = await ADAPTERS.accounting._tenant(env, h);
+        const rep = await h.fetchJson('https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?fromDate=' + from + '&toDate=' + to,
+          { headers: { 'Xero-Tenant-Id': t.id, 'Accept': 'application/json' } });
+        const report = rep && rep.Reports && rep.Reports[0];
+        const rows = (report && report.Rows) || [];
+        const sections = [];
+        for (const sec of rows) {
+          if (sec.RowType !== 'Section') continue;
+          let summary = null, rowSum = 0; const wageLines = [];
+          for (const r of (sec.Rows || [])) {
+            if (r.RowType === 'SummaryRow') summary = xeroRowAmount(r.Cells);
+            else if (r.RowType === 'Row') {
+              rowSum += xeroRowAmount(r.Cells);
+              if (XERO_WAGE_RE.test(xeroRowLabel(r.Cells))) wageLines.push({ label: xeroRowLabel(r.Cells), amount: xeroRowAmount(r.Cells), cells: (r.Cells || []).length });
+            }
+          }
+          sections.push({ title: sec.Title || '', summary: summary, rowSum: Math.round(rowSum * 100) / 100, wageLines: wageLines });
+        }
+        return json({ org: t.name, reportTitles: report && report.ReportTitles, sections: sections, parsed: parseXeroPL(rep) });
+      } catch (e) { return json({ error: String(e && e.message) }, 500); }
+    }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
       if (!loggedIn) return Response.redirect(url.origin + '/', 302);
