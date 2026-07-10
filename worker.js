@@ -357,6 +357,93 @@ const ADAPTERS = {
       return cnt;
     },
 
+    /* Catalog item-name -> category-name map (for grouping top sellers). Cached
+       24h. Item/category names are trimmed to match order line-item names. */
+    async _catalogMap(env, h) {
+      const cached = await env.TOKENS.get('catalog:itemcat');
+      if (cached) { try { return JSON.parse(cached); } catch (e) {} }
+      const catNames = {};
+      let cursor = null, guard = 0;
+      do {
+        let u = 'https://connect.squareup.com/v2/catalog/list?types=CATEGORY';
+        if (cursor) u += '&cursor=' + encodeURIComponent(cursor);
+        const d = await h.fetchJson(u, { headers: this._headers(env) }, { auth: false });
+        for (const o of (d.objects || [])) { if (o.type === 'CATEGORY') catNames[o.id] = (o.category_data && o.category_data.name) || ''; }
+        cursor = d.cursor || null; guard++;
+      } while (cursor && guard < 8);
+      const itemCat = {};
+      cursor = null; guard = 0;
+      do {
+        let u = 'https://connect.squareup.com/v2/catalog/list?types=ITEM';
+        if (cursor) u += '&cursor=' + encodeURIComponent(cursor);
+        const d = await h.fetchJson(u, { headers: this._headers(env) }, { auth: false });
+        for (const o of (d.objects || [])) {
+          if (o.type !== 'ITEM') continue;
+          const idata = o.item_data || {};
+          let catId = (idata.reporting_category && idata.reporting_category.id) || (Array.isArray(idata.categories) && idata.categories[0] && idata.categories[0].id) || idata.category_id;
+          const cat = (catId && catNames[catId]) || '';
+          if (idata.name) itemCat[idata.name.trim()] = cat;
+        }
+        cursor = d.cursor || null; guard++;
+      } while (cursor && guard < 20);
+      await env.TOKENS.put('catalog:itemcat', JSON.stringify(itemCat), { expirationTtl: 86400 });
+      return itemCat;
+    },
+
+    /* Top-seller running totals for a short window ('today' or 'week' = Mon..today).
+       Coffee size mix + top-3 Brunch + top-3 Sandwiches + roll totals. */
+    async _sellers(env, h, window) {
+      const tz = 'Australia/Sydney';
+      const now = new Date();
+      const todayYmd = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
+      let fromYmd;
+      if (window === 'today') { fromYmd = todayYmd; }
+      else { const dow = new Date(todayYmd + 'T12:00:00Z').getUTCDay(); fromYmd = addDays(todayYmd, -((dow + 6) % 7)); }
+      const locs = await this._locations(env, h);
+      const ids = locs.map((l) => l.id);
+      const itemCat = await this._catalogMap(env, h);
+      const startAt = localToUTC(tz, fromYmd, 0).toISOString();
+      const endAt = localToUTC(tz, addDays(todayYmd, 1), 0).toISOString();
+      const tally = {};
+      let cursor = null, guard = 0;
+      do {
+        const body = { location_ids: ids, limit: 500,
+          query: { filter: { date_time_filter: { created_at: { start_at: startAt, end_at: endAt } },
+            state_filter: { states: ['COMPLETED', 'OPEN'] } },
+            sort: { sort_field: 'CREATED_AT', sort_order: 'ASC' } } };
+        if (cursor) body.cursor = cursor;
+        const d = await h.fetchJson('https://connect.squareup.com/v2/orders/search',
+          { method: 'POST', headers: this._headers(env), body: JSON.stringify(body) }, { auth: false });
+        for (const o of (d.orders || [])) {
+          for (const li of (o.line_items || [])) {
+            const nm = (li.name || '').trim();
+            if (!nm) continue;
+            tally[nm] = (tally[nm] || 0) + (parseFloat(li.quantity || '1') || 0);
+          }
+        }
+        cursor = d.cursor || null; guard++;
+      } while (cursor && guard < 20);
+      const q = (n) => Math.round((tally[n] || 0) * 100) / 100;
+      const topInCat = (catName, n) => Object.keys(tally)
+        .filter((nm) => (itemCat[nm] || '') === catName)
+        .map((nm) => ({ name: nm, qty: Math.round(tally[nm] * 100) / 100 }))
+        .sort((a, b) => b.qty - a.qty).slice(0, n);
+      return {
+        window: window, from: fromYmd, to: todayYmd,
+        coffee_mix: [
+          { name: 'Small', qty: q('SMALL COFFEE') },
+          { name: 'Large', qty: q('LARGE COFFEE') },
+          { name: 'Tall', qty: q('TALL COFFEE') }
+        ],
+        brunch_top3: topInCat('Brunch', 3),
+        sandwiches_top3: topInCat('Sandwiches', 3),
+        rolls: [
+          { name: 'Egg & Bacon Roll', qty: q('Egg & Bacon Roll') },
+          { name: 'Egg Sausage Muffin', qty: q('Egg Sausage Muffin') }
+        ]
+      };
+    },
+
     async fetchRange(env, h, q) {
       const locs = await this._locations(env, h);
       const ids = locs.map((l) => l.id);
@@ -1081,86 +1168,19 @@ export default {
       for (const d of eachDate(from, to)) { await env.TOKENS.delete('data:rostering:' + d); cleared++; }
       return json({ ok: true, cleared: cleared });
     }
-    if (path === '/api/debug/items' && request.method === 'GET') {
+    if (path === '/api/sellers' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
-      const days = Math.max(1, Math.min(31, parseInt(url.searchParams.get('days') || '7', 10) || 7));
-      const tz = 'Australia/Sydney';
+      const window = url.searchParams.get('window') === 'today' ? 'today' : 'week';
+      const ck = 'sellerscache:' + window;
+      if (url.searchParams.get('refresh') !== '1') {
+        const c = await env.TOKENS.get(ck);
+        if (c) { try { return json(JSON.parse(c)); } catch (e) {} }
+      }
       const h = makeHelpers(env, 'pos');
       try {
-        const locs = await ADAPTERS.pos._locations(env, h);
-        const ids = locs.map((l) => l.id);
-        const now = new Date();
-        const toYmd = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
-        const fromYmd = addDays(toYmd, -days + 1);
-        const startAt = localToUTC(tz, fromYmd, 0).toISOString();
-        const endAt = localToUTC(tz, addDays(toYmd, 1), 0).toISOString();
-        const byName = {}, byVariation = {}, cats = {};
-        let cursor = null, guard = 0, orders = 0, sample = null;
-        do {
-          const body = { location_ids: ids, limit: 500,
-            query: { filter: { date_time_filter: { created_at: { start_at: startAt, end_at: endAt } },
-              state_filter: { states: ['COMPLETED', 'OPEN'] } },
-              sort: { sort_field: 'CREATED_AT', sort_order: 'ASC' } } };
-          if (cursor) body.cursor = cursor;
-          const d = await h.fetchJson('https://connect.squareup.com/v2/orders/search',
-            { method: 'POST', headers: ADAPTERS.pos._headers(env), body: JSON.stringify(body) }, { auth: false });
-          for (const o of (d.orders || [])) {
-            orders++;
-            for (const li of (o.line_items || [])) {
-              const qty = parseFloat(li.quantity || '1') || 1;
-              const nm = li.name || '(unnamed)';
-              const vn = li.variation_name || '';
-              byName[nm] = (byName[nm] || 0) + qty;
-              const kv = vn ? (nm + ' — ' + vn) : nm;
-              byVariation[kv] = (byVariation[kv] || 0) + qty;
-              if (li.category_name) cats[li.category_name] = (cats[li.category_name] || 0) + qty;
-              if (!sample) sample = li;
-            }
-          }
-          cursor = d.cursor || null; guard++;
-        } while (cursor && guard < 12);
-        const top = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, 40).map(([k, v]) => ({ item: k, qty: Math.round(v * 100) / 100 }));
-        return json({ range: { from: fromYmd, to: toYmd }, orders_scanned: orders,
-          categories: top(cats), top_by_name: top(byName), top_by_variation: top(byVariation),
-          sample_line_item: sample });
-      } catch (e) { return json({ error: String(e && e.message) }, 500); }
-    }
-    if (path === '/api/debug/catalog' && request.method === 'GET') {
-      if (!loggedIn) return json({ error: 'auth' }, 401);
-      const h = makeHelpers(env, 'pos');
-      try {
-        // categories
-        const catNames = {};
-        let cursor = null, guard = 0;
-        do {
-          let u = 'https://connect.squareup.com/v2/catalog/list?types=CATEGORY';
-          if (cursor) u += '&cursor=' + encodeURIComponent(cursor);
-          const d = await h.fetchJson(u, { headers: ADAPTERS.pos._headers(env) }, { auth: false });
-          for (const o of (d.objects || [])) { if (o.type === 'CATEGORY') catNames[o.id] = (o.category_data && o.category_data.name) || o.id; }
-          cursor = d.cursor || null; guard++;
-        } while (cursor && guard < 8);
-        // items -> category
-        const byCat = {}; let items = 0;
-        cursor = null; guard = 0;
-        do {
-          let u = 'https://connect.squareup.com/v2/catalog/list?types=ITEM';
-          if (cursor) u += '&cursor=' + encodeURIComponent(cursor);
-          const d = await h.fetchJson(u, { headers: ADAPTERS.pos._headers(env) }, { auth: false });
-          for (const o of (d.objects || [])) {
-            if (o.type !== 'ITEM') continue;
-            items++;
-            const idata = o.item_data || {};
-            let catId = idata.reporting_category && idata.reporting_category.id;
-            if (!catId && Array.isArray(idata.categories) && idata.categories.length) catId = idata.categories[0].id;
-            if (!catId && idata.category_id) catId = idata.category_id;
-            const cat = (catId && catNames[catId]) || '(no category)';
-            (byCat[cat] = byCat[cat] || []).push(idata.name);
-          }
-          cursor = d.cursor || null; guard++;
-        } while (cursor && guard < 20);
-        const summary = Object.entries(byCat).map(([cat, names]) => ({ category: cat, count: names.length, items: names.slice(0, 60) }))
-          .sort((a, b) => b.count - a.count);
-        return json({ total_categories: Object.keys(catNames).length, total_items: items, by_category: summary });
+        const result = await ADAPTERS.pos._sellers(env, h, window);
+        try { await env.TOKENS.put(ck, JSON.stringify(result), { expirationTtl: 300 }); } catch (e) {}
+        return json(result);
       } catch (e) { return json({ error: String(e && e.message) }, 500); }
     }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);

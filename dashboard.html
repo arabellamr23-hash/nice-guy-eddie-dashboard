@@ -555,6 +555,7 @@ function fetchData(force) {
     return;
   }
   state.loading = true; state.fetchError = null;
+  if (force) state.sellersData = {};
   render();
   fetch(apiUrl(force)).then(function (res) {
     if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -886,12 +887,86 @@ function renderDashboard(root) {
   var cur = periodValues('cur'), prev = periodValues('prev'), yoy = periodValues('yoy');
   CHOSEN.forEach(function (k) { grid.appendChild(metricCard(k, cur, prev, yoy, r)); });
   root.appendChild(grid);
+
+  if (!isManual() && isConfigured('pos')) renderTopSellers(root);
 }
 
 function periodLabel() {
   var p = PERIODS.filter(function (x) { return x.key === state.period; })[0];
   return p ? p.label.replace('…', '') : '';
 }
+
+/* ---------- Top sellers (live item mix from Square) ---------- */
+function renderTopSellers(root) {
+  if (!state.sellersWindow) state.sellersWindow = 'week';
+  if (!state.sellersData) state.sellersData = {};
+  var w = state.sellersWindow;
+  var sec = el('div', 'sellers-section');
+  sec.style.marginTop = '30px';
+  var head = el('div');
+  head.style.cssText = 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px';
+  head.appendChild(el('div', 'period-heading', 'Top sellers'));
+  ['today', 'week'].forEach(function (k) {
+    var b = el('button', 'pchip' + (w === k ? ' on' : ''), k === 'today' ? 'Today' : 'This week');
+    b.onclick = function () { state.sellersWindow = k; render(); };
+    head.appendChild(b);
+  });
+  sec.appendChild(head);
+  var body = el('div');
+  sec.appendChild(body);
+  root.appendChild(sec);
+
+  var data = state.sellersData[w];
+  if (data) { renderSellersBody(body, data); return; }
+  body.innerHTML = '<span class="spin"></span> Loading top sellers…';
+  if (state.sellersLoading === w) return;
+  state.sellersLoading = w;
+  fetch('/api/sellers?window=' + w).then(function (r) { return r.json(); }).then(function (j) {
+    state.sellersLoading = null;
+    if (j && !j.error) { state.sellersData[w] = j; render(); }
+    else { body.innerHTML = '<div class="m-sub">Couldn’t load top sellers just now.</div>'; }
+  }).catch(function () { state.sellersLoading = null; body.innerHTML = '<div class="m-sub">Couldn’t load top sellers just now.</div>'; });
+}
+
+function renderSellersBody(body, d) {
+  body.innerHTML = '';
+  var grid = el('div', 'cards');
+  var cm = d.coffee_mix || [];
+  var total = cm.reduce(function (s, x) { return s + (x.qty || 0); }, 0);
+  var c1 = el('div', 'mcard');
+  c1.appendChild(el('div', 'm-label', 'Coffee mix'));
+  cm.forEach(function (x) {
+    var pct = total ? Math.round((x.qty / total) * 100) : 0;
+    var row = el('div');
+    row.style.cssText = 'margin:9px 0';
+    row.innerHTML = '<div style="display:flex;justify-content:space-between;font-weight:600"><span>' + esc(x.name) + '</span><span>' + x.qty + ' · ' + pct + '%</span></div>'
+      + '<div style="height:6px;background:rgba(0,0,0,.08);border-radius:4px;margin-top:5px"><div style="height:6px;border-radius:4px;width:' + pct + '%;background:var(--accent,#c9762b)"></div></div>';
+    c1.appendChild(row);
+  });
+  grid.appendChild(c1);
+  grid.appendChild(sellerListCard('Top 3 brunch', d.brunch_top3));
+  grid.appendChild(sellerListCard('Top 3 sandwiches', d.sandwiches_top3));
+  grid.appendChild(sellerListCard('Rolls', d.rolls));
+  body.appendChild(grid);
+  var note = el('div', 'm-def');
+  note.style.marginTop = '8px';
+  note.innerHTML = 'From Square line items · ' + (d.window === 'today' ? 'today' : 'this week (Mon–today)') + ' · refreshes every few minutes';
+  body.appendChild(note);
+}
+
+function sellerListCard(label, items) {
+  var c = el('div', 'mcard');
+  c.appendChild(el('div', 'm-label', esc(label)));
+  if (!items || !items.length) { c.appendChild(el('div', 'm-sub', 'No sales in this window')); return c; }
+  items.forEach(function (x) {
+    var row = el('div');
+    row.style.cssText = 'display:flex;justify-content:space-between;margin:8px 0;font-weight:600';
+    row.innerHTML = '<span>' + esc(x.name) + '</span><span>' + x.qty + '</span>';
+    c.appendChild(row);
+  });
+  return c;
+}
+
 
 function metricCard(key, cur, prev, yoy, r) {
   var def = METRIC_DEFS[key];
