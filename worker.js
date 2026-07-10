@@ -1125,6 +1125,44 @@ export default {
           sample_line_item: sample });
       } catch (e) { return json({ error: String(e && e.message) }, 500); }
     }
+    if (path === '/api/debug/catalog' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      const h = makeHelpers(env, 'pos');
+      try {
+        // categories
+        const catNames = {};
+        let cursor = null, guard = 0;
+        do {
+          let u = 'https://connect.squareup.com/v2/catalog/list?types=CATEGORY';
+          if (cursor) u += '&cursor=' + encodeURIComponent(cursor);
+          const d = await h.fetchJson(u, { headers: ADAPTERS.pos._headers(env) }, { auth: false });
+          for (const o of (d.objects || [])) { if (o.type === 'CATEGORY') catNames[o.id] = (o.category_data && o.category_data.name) || o.id; }
+          cursor = d.cursor || null; guard++;
+        } while (cursor && guard < 8);
+        // items -> category
+        const byCat = {}; let items = 0;
+        cursor = null; guard = 0;
+        do {
+          let u = 'https://connect.squareup.com/v2/catalog/list?types=ITEM';
+          if (cursor) u += '&cursor=' + encodeURIComponent(cursor);
+          const d = await h.fetchJson(u, { headers: ADAPTERS.pos._headers(env) }, { auth: false });
+          for (const o of (d.objects || [])) {
+            if (o.type !== 'ITEM') continue;
+            items++;
+            const idata = o.item_data || {};
+            let catId = idata.reporting_category && idata.reporting_category.id;
+            if (!catId && Array.isArray(idata.categories) && idata.categories.length) catId = idata.categories[0].id;
+            if (!catId && idata.category_id) catId = idata.category_id;
+            const cat = (catId && catNames[catId]) || '(no category)';
+            (byCat[cat] = byCat[cat] || []).push(idata.name);
+          }
+          cursor = d.cursor || null; guard++;
+        } while (cursor && guard < 20);
+        const summary = Object.entries(byCat).map(([cat, names]) => ({ category: cat, count: names.length, items: names.slice(0, 60) }))
+          .sort((a, b) => b.count - a.count);
+        return json({ total_categories: Object.keys(catNames).length, total_items: items, by_category: summary });
+      } catch (e) { return json({ error: String(e && e.message) }, 500); }
+    }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
       if (!loggedIn) return Response.redirect(url.origin + '/', 302);
