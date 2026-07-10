@@ -353,7 +353,7 @@ const ADAPTERS = {
       const startAt = localToUTC(tz, first, rollover).toISOString();
       const endAt = localToUTC(tz, nextFirst, rollover).toISOString();
       const cnt = await this._count(env, h, startAt, endAt, ids);
-      await env.TOKENS.put(key, String(cnt), { expirationTtl: past ? 86400 : 3600 });
+      await env.TOKENS.put(key, String(cnt), { expirationTtl: past ? 5184000 : 3600 });
       return cnt;
     },
 
@@ -361,11 +361,29 @@ const ADAPTERS = {
       const locs = await this._locations(env, h);
       const ids = locs.map((l) => l.id);
       if (!ids.length) return { count: 0 };
-      const ym = monthAligned(q.from, q.to);
-      if (ym) return { count: await this._monthCount(env, h, ids, q.tz, q.rollover, ym) };
-      const startAt = localToUTC(q.tz, q.from, q.rollover).toISOString();
-      const endAt = localToUTC(q.tz, addDays(q.to, 1), q.rollover).toISOString();
-      return { count: await this._count(env, h, startAt, endAt, ids) };
+      /* Decompose the range into whole calendar months (served from the month
+         cache) plus any partial edges (counted directly). Keeps every request
+         well under the free-plan subrequest cap and reuses warmed months. */
+      let total = 0;
+      let [y, mo] = q.from.split('-').map(Number);
+      while (true) {
+        const p2 = String(mo).padStart(2, '0');
+        const mStart = y + '-' + p2 + '-01';
+        const lastDay = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+        const mEnd = y + '-' + p2 + '-' + String(lastDay).padStart(2, '0');
+        const segFrom = (q.from > mStart) ? q.from : mStart;
+        const segTo = (q.to < mEnd) ? q.to : mEnd;
+        if (segFrom === mStart && segTo === mEnd) {
+          total += await this._monthCount(env, h, ids, q.tz, q.rollover, y + '-' + p2);
+        } else {
+          const startAt = localToUTC(q.tz, segFrom, q.rollover).toISOString();
+          const endAt = localToUTC(q.tz, addDays(segTo, 1), q.rollover).toISOString();
+          total += await this._count(env, h, startAt, endAt, ids);
+        }
+        if (mEnd >= q.to) break;
+        mo++; if (mo > 12) { mo = 1; y++; }
+      }
+      return { count: total };
     },
 
     async fetchMonthly(env, h, q) {
@@ -1083,20 +1101,38 @@ export default {
   /* Cron rung: uncomment [triggers] in wrangler.toml and give any adapter a
      scheduledPull() to fetch its tool's own export on a schedule. */
   async scheduled(event, env, ctx) {
-    /* Warm the month caches so user page loads are fast (never a cold 12-month
-       recompute in front of the owner). Last 13 months, current tz defaults. */
+    /* Warm the month caches a few at a time so page loads never do a cold
+       year-long recount (which would exceed the free-plan subrequest cap).
+       Runs every 30 min: computes any UNCACHED past pos months (max 3/run),
+       and refreshes accounting months (cheap - 1 call each). */
+    const tz = 'Australia/Sydney', rollover = 0;
+    const now = new Date();
+    const months = [];
+    for (let k = 0; k < 13; k++) {
+      const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - k, 1));
+      months.push(d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0'));
+    }
+    const curKey = now.getUTCFullYear() + '-' + String(now.getUTCMonth() + 1).padStart(2, '0');
+    // Accounting: cheap, refresh all.
     try {
-      const tz = 'Australia/Sydney', rollover = 0;
-      const now = new Date();
-      const months = [];
-      for (let i = 0; i < 13; i++) { const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1)); months.push(d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0')); }
-      const acc = ADAPTERS.accounting, pos = ADAPTERS.pos;
-      const ha = makeHelpers(env, 'accounting');
+      const acc = ADAPTERS.accounting, ha = makeHelpers(env, 'accounting');
       for (const m of months) { try { await acc._monthPL(env, ha, m); } catch (e) {} }
-      const hp = makeHelpers(env, 'pos');
-      let ids = [];
-      try { ids = (await pos._locations(env, hp)).map((l) => l.id); } catch (e) {}
-      if (ids.length) { for (const m of months) { try { await pos._monthCount(env, hp, ids, tz, rollover, m); } catch (e) {} } }
+    } catch (e) {}
+    // POS: only compute uncached past months, capped per run.
+    try {
+      const pos = ADAPTERS.pos, hp = makeHelpers(env, 'pos');
+      const ids = (await pos._locations(env, hp)).map((l) => l.id);
+      if (ids.length) {
+        let budget = 3;
+        for (const m of months) {
+          if (m >= curKey) { try { await pos._monthCount(env, hp, ids, tz, rollover, m); } catch (e) {} continue; }
+          const have = await env.TOKENS.get('poscount:' + tz + ':' + rollover + ':' + m);
+          if (have != null) continue;
+          if (budget <= 0) continue;
+          budget--;
+          try { await pos._monthCount(env, hp, ids, tz, rollover, m); } catch (e) {}
+        }
+      }
     } catch (e) { console.log('warm failed: ' + (e && e.message)); }
     for (const source of ['accounting', 'pos', 'rostering']) {
       const a = ADAPTERS[source];
@@ -1107,15 +1143,6 @@ export default {
     }
   },
 
-  /* Email rung (Path B): the tool's own report scheduler emails its export;
-     the owner's domain on their Cloudflare routes that address here (Email
-     Routing -> this Worker). Complete when this rung is chosen:
-       1. parse the message with postal-mime (add the dependency)
-       2. find the CSV/report attachment, work out which source sent it
-          (sender address or subject)
-       3. reuse adapter.parseExport + saveIngestedRows + noteSync, exactly
-          like /api/ingest
-     Until then this logs and discards. */
   async email(message, env, ctx) {
     console.log('email received from ' + message.from + '; email ingest not wired yet');
   }
