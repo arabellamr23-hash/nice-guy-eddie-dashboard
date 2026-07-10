@@ -116,22 +116,31 @@ function parseXeroPL(rep) {
   const report = rep && rep.Reports && rep.Reports[0];
   const rows = (report && report.Rows) || [];
   let revenue = 0, cogs = 0, wagesSuper = 0, opExTotal = 0;
+  let inOpEx = false;
+  const scanWages = (sec) => {
+    for (const r of (sec.Rows || [])) {
+      if (r.RowType === 'Row' && XERO_WAGE_RE.test(xeroRowLabel(r.Cells))) {
+        wagesSuper += xeroRowAmount(r.Cells);
+      }
+    }
+  };
   for (const sec of rows) {
     if (sec.RowType !== 'Section') continue;
     const title = (sec.Title || '').toLowerCase();
-    if (/other income/.test(title)) continue;
-    if (/cost of sales|cost of goods|cogs/.test(title)) {
-      cogs += xeroSectionTotal(sec);
-    } else if (/operating expense|overhead|expense/.test(title)) {
-      opExTotal += xeroSectionTotal(sec);
-      for (const r of (sec.Rows || [])) {
-        if (r.RowType === 'Row' && XERO_WAGE_RE.test(xeroRowLabel(r.Cells))) {
-          wagesSuper += xeroRowAmount(r.Cells);
-        }
-      }
-    } else if (/income|revenue/.test(title)) {
-      revenue += xeroSectionTotal(sec);
+    if (/other income/.test(title)) continue;                       // excluded from Revenue
+    if (/cost of sales|cost of goods|cogs/.test(title)) { cogs += xeroSectionTotal(sec); continue; }
+    if (/operating expense/.test(title)) {                          // the OpEx header (may hold ungrouped rows)
+      inOpEx = true; opExTotal += xeroSectionTotal(sec); scanWages(sec); continue;
     }
+    if (inOpEx) {
+      /* Grouped P&L: expense sub-groups (Administrative, Bank Fees, Employment
+         Expenses, ...) follow the OpEx header as named sibling sections. Blank-
+         titled sections here are report totals (Total Operating Expenses, Net
+         Profit) - skip them so we don't double count. */
+      if (title !== '') { opExTotal += xeroSectionTotal(sec); scanWages(sec); }
+      continue;
+    }
+    if (/income|revenue/.test(title)) { revenue += xeroSectionTotal(sec); continue; }
   }
   const overheads = opExTotal - wagesSuper;
   return { revenue: revenue, cogs: cogs, wagesSuper: wagesSuper, overheads: overheads };
@@ -973,33 +982,6 @@ export default {
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
-    }
-    if (path === '/api/debug/pl' && request.method === 'GET') {
-      if (!loggedIn) return json({ error: 'auth' }, 401);
-      const from = url.searchParams.get('from') || '2026-06-01';
-      const to = url.searchParams.get('to') || '2026-06-30';
-      try {
-        const h = makeHelpers(env, 'accounting');
-        const t = await ADAPTERS.accounting._tenant(env, h);
-        const rep = await h.fetchJson('https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?fromDate=' + from + '&toDate=' + to,
-          { headers: { 'Xero-Tenant-Id': t.id, 'Accept': 'application/json' } });
-        const report = rep && rep.Reports && rep.Reports[0];
-        const rows = (report && report.Rows) || [];
-        const sections = [];
-        for (const sec of rows) {
-          if (sec.RowType !== 'Section') continue;
-          let summary = null, rowSum = 0; const wageLines = [];
-          for (const r of (sec.Rows || [])) {
-            if (r.RowType === 'SummaryRow') summary = xeroRowAmount(r.Cells);
-            else if (r.RowType === 'Row') {
-              rowSum += xeroRowAmount(r.Cells);
-              if (XERO_WAGE_RE.test(xeroRowLabel(r.Cells))) wageLines.push({ label: xeroRowLabel(r.Cells), amount: xeroRowAmount(r.Cells), cells: (r.Cells || []).length });
-            }
-          }
-          sections.push({ title: sec.Title || '', summary: summary, rowSum: Math.round(rowSum * 100) / 100, wageLines: wageLines });
-        }
-        return json({ org: t.name, reportTitles: report && report.ReportTitles, sections: sections, parsed: parseXeroPL(rep) });
-      } catch (e) { return json({ error: String(e && e.message) }, 500); }
     }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
