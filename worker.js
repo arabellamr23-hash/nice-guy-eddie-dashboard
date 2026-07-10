@@ -1090,7 +1090,7 @@ export default {
         const startAt = localToUTC(tz, from, 0).toISOString();
         const endAt = localToUTC(tz, addDays(to, 1), 0).toISOString();
         let cursor = null, guard = 0;
-        let completed = 0, openZero = 0, openNonzero = 0, other = 0;
+        let completed = 0, openTender = 0, openZero = 0, openNonzero = 0, other = 0;
         do {
           const body = { location_ids: [loc], limit: 500,
             query: { filter: { date_time_filter: { created_at: { start_at: startAt, end_at: endAt } },
@@ -1101,15 +1101,18 @@ export default {
             { method: 'POST', headers: ADAPTERS.pos._headers(env), body: JSON.stringify(body) }, { auth: false });
           for (const o of (d.orders || [])) {
             const tot = (o.total_money && o.total_money.amount) || 0;
+            const hasTender = Array.isArray(o.tenders) && o.tenders.length > 0;
             if (o.state === 'COMPLETED') completed++;
+            else if (o.state === 'OPEN' && hasTender) openTender++;
             else if (o.state === 'OPEN' && tot === 0) openZero++;
             else if (o.state === 'OPEN') openNonzero++;
             else other++;
           }
           cursor = d.cursor || null; guard++;
         } while (cursor && guard < 400);
-        return json({ location: active.name, completed, open_zero: openZero, open_nonzero: openNonzero, other,
-          completed_plus_openzero: completed + openZero });
+        return json({ location: active.name, completed, open_with_tender: openTender,
+          open_zero_no_tender: openZero, open_nonzero_no_tender: openNonzero, other,
+          completed_plus_open_tender: completed + openTender });
       } catch (e) { return json({ error: String(e && e.message) }, 500); }
     }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
