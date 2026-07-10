@@ -177,12 +177,20 @@ const ADAPTERS = {
     /* Resolve the Xero organisation (tenant) for the connected token. Cached in
        KV so /connections isn't hit on every metric call. */
     async _tenant(env, h) {
+      /* A Xero login can grant access to several organisations. Pin the venue's
+         org (env.ACCOUNTING_TENANT_ID, set in wrangler.toml) so the board can
+         never drift to another company's books. */
+      const pinned = env.ACCOUNTING_TENANT_ID || (await env.TOKENS.get('xero:chosen_tenant_id'));
       const cached = await env.TOKENS.get('xero:tenant');
-      if (cached) { try { return JSON.parse(cached); } catch (e) {} }
+      if (cached) {
+        try { const c = JSON.parse(cached); if (!pinned || c.id === pinned) return c; } catch (e) {}
+      }
       const conns = await h.fetchJson('https://api.xero.com/connections');
       const list = Array.isArray(conns) ? conns.filter((c) => c.tenantType === 'ORGANISATION') : [];
       if (!list.length) { const e = new Error('no tenant'); e.status = 401; throw e; }
-      const t = { id: list[0].tenantId, name: list[0].tenantName || '' };
+      let chosen = pinned ? list.find((c) => c.tenantId === pinned) : null;
+      if (!chosen) chosen = list[0];
+      const t = { id: chosen.tenantId, name: chosen.tenantName || '' };
       await env.TOKENS.put('xero:tenant', JSON.stringify(t), { expirationTtl: 3600 });
       return t;
     },
@@ -258,14 +266,21 @@ const ADAPTERS = {
     },
 
     async _locations(env, h) {
+      let locs = null;
       const cached = await env.TOKENS.get('square:locations');
-      if (cached) { try { return JSON.parse(cached); } catch (e) {} }
-      const data = await h.fetchJson('https://connect.squareup.com/v2/locations',
-        { headers: this._headers(env) }, { auth: false });
-      const locs = (data.locations || [])
-        .filter((l) => l.status === 'ACTIVE')
-        .map((l) => ({ id: l.id, name: l.name, tz: l.timezone }));
-      await env.TOKENS.put('square:locations', JSON.stringify(locs), { expirationTtl: 3600 });
+      if (cached) { try { locs = JSON.parse(cached); } catch (e) {} }
+      if (!locs) {
+        const data = await h.fetchJson('https://connect.squareup.com/v2/locations',
+          { headers: this._headers(env) }, { auth: false });
+        locs = (data.locations || [])
+          .filter((l) => l.status === 'ACTIVE')
+          .map((l) => ({ id: l.id, name: l.name, tz: l.timezone }));
+        await env.TOKENS.put('square:locations', JSON.stringify(locs), { expirationTtl: 3600 });
+      }
+      /* Pin the venue's location(s) so the count can never drift to another
+         venue on the same Square login. env.POS_LOCATION_IDS = comma-separated. */
+      const pin = (env.POS_LOCATION_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
+      if (pin.length) locs = locs.filter((l) => pin.includes(l.id));
       return locs;
     },
 
@@ -972,6 +987,43 @@ export default {
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
+    }
+    if (path === '/api/debug/entities' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      const from = url.searchParams.get('from') || '2026-06-01';
+      const to = url.searchParams.get('to') || '2026-06-30';
+      const result = { range: { from, to }, xero_orgs: [], square_locations: [] };
+      // Xero orgs
+      try {
+        const h = makeHelpers(env, 'accounting');
+        const conns = await h.fetchJson('https://api.xero.com/connections');
+        const list = Array.isArray(conns) ? conns.filter((c) => c.tenantType === 'ORGANISATION') : [];
+        for (const c of list) {
+          let rev = null, err = null;
+          try {
+            const rep = await h.fetchJson('https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?fromDate=' + from + '&toDate=' + to,
+              { headers: { 'Xero-Tenant-Id': c.tenantId, 'Accept': 'application/json' } });
+            rev = parseXeroPL(rep).revenue;
+          } catch (e) { err = String(e && e.message); }
+          result.xero_orgs.push({ name: c.tenantName, tenantId: c.tenantId, june_revenue: rev, error: err });
+        }
+      } catch (e) { result.xero_error = String(e && e.message); }
+      // Square locations
+      try {
+        const h = makeHelpers(env, 'pos');
+        const data = await h.fetchJson('https://connect.squareup.com/v2/locations',
+          { headers: ADAPTERS.pos._headers(env) }, { auth: false });
+        const tz = url.searchParams.get('tz') || 'Australia/Sydney';
+        const startAt = localToUTC(tz, from, 0).toISOString();
+        const endAt = localToUTC(tz, addDays(to, 1), 0).toISOString();
+        for (const l of (data.locations || [])) {
+          let cnt = null, err = null;
+          try { cnt = await ADAPTERS.pos._count(env, h, startAt, endAt, [l.id]); }
+          catch (e) { err = String(e && e.message); }
+          result.square_locations.push({ id: l.id, name: l.name, status: l.status, june_count: cnt, error: err });
+        }
+      } catch (e) { result.square_error = String(e && e.message); }
+      return json(result);
     }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
