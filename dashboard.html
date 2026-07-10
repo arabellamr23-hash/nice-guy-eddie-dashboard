@@ -947,11 +947,31 @@ function renderSellersBody(body, d) {
   grid.appendChild(sellerListCard('Top 3 brunch', d.brunch_top3));
   grid.appendChild(sellerListCard('Top 3 sandwiches', d.sandwiches_top3));
   grid.appendChild(sellerListCard('Rolls', d.rolls));
+  grid.appendChild(sellerPastryCard(d));
   body.appendChild(grid);
   var note = el('div', 'm-def');
   note.style.marginTop = '8px';
   note.innerHTML = 'From Square line items · ' + (d.window === 'today' ? 'today' : 'this week (Mon–today)') + ' · refreshes every few minutes';
   body.appendChild(note);
+}
+
+function sellerPastryCard(d) {
+  var c = el('div', 'mcard');
+  c.appendChild(el('div', 'm-label', 'Pastries'));
+  var sc = el('div');
+  sc.style.cssText = 'display:flex;justify-content:space-between;margin:8px 0 10px;font-weight:700';
+  sc.innerHTML = '<span>Cinnamon scrolls</span><span>' + ((d && d.scrolls) || 0) + '</span>';
+  c.appendChild(sc);
+  var items = (d && d.pastries_top5) || [];
+  if (!items.length) { c.appendChild(el('div', 'm-sub', 'No pastry sales in this window')); return c; }
+  c.appendChild(el('div', 'm-sub', 'Top 5 pastries'));
+  items.forEach(function (x) {
+    var row = el('div');
+    row.style.cssText = 'display:flex;justify-content:space-between;margin:7px 0;font-weight:600';
+    row.innerHTML = '<span>' + esc(x.name) + '</span><span>' + x.qty + '</span>';
+    c.appendChild(row);
+  });
+  return c;
 }
 
 function sellerListCard(label, items) {

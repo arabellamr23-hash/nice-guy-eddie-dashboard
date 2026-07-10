@@ -440,7 +440,9 @@ const ADAPTERS = {
         rolls: [
           { name: 'Egg & Bacon Roll', qty: q('Egg & Bacon Roll') },
           { name: 'Egg Sausage Muffin', qty: q('Egg Sausage Muffin') }
-        ]
+        ],
+        scrolls: q('Scrolls'),
+        pastries_top5: topInCat('Pastries', 5)
       };
     },
 
@@ -1171,7 +1173,7 @@ export default {
     if (path === '/api/sellers' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       const window = url.searchParams.get('window') === 'today' ? 'today' : 'week';
-      const ck = 'sellerscache:' + window;
+      const ck = 'sellerscache:v2:' + window;
       if (url.searchParams.get('refresh') !== '1') {
         const c = await env.TOKENS.get(ck);
         if (c) { try { return json(JSON.parse(c)); } catch (e) {} }
