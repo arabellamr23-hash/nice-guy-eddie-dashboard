@@ -356,12 +356,33 @@ const ADAPTERS = {
      Example (Deputy): pasted permanent token (secret ROSTERING_API_TOKEN).
   */
   rostering: {
-    configured: false,
+    /* Manual projected wage: the owner's Connecteam plan has no API access, so
+       rostered labour cost is entered by hand (POST via /api/roster/set, stored
+       as daily prorated rows in the ingest store). Projected Wage % = this cost
+       / revenue, always labelled 'projected'. Actual Wage % (from Xero) is the
+       real number and is unaffected. */
+    configured: true,
     auth: null,
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('rostering'); },
-    async fetchMonthly(env, h, q) { return { months: [], cost: [] }; }
+    async status(env, h) {
+      return { connected: true, org: 'Connecteam (entered manually)', sandbox: false, lastSync: (await lastSync(env, 'rostering')) || null };
+    },
+    async fetchRange(env, h, q) {
+      const r = await h.readIngested(q.from, q.to);
+      return { cost: r.daysWithData ? (r.sums.cost || 0) : null };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const out = { months: months, cost: [] };
+      for (const m of months) {
+        const [y, mo] = m.split('-').map(Number);
+        const first = m + '-01';
+        const last = m + '-' + String(new Date(Date.UTC(y, mo, 0)).getUTCDate()).padStart(2, '0');
+        const r = await h.readIngested(first, last);
+        out.cost.push(r.daysWithData ? (r.sums.cost || 0) : null);
+      }
+      return out;
+    }
   }
 };
 
@@ -982,6 +1003,29 @@ export default {
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
+    }
+    if (path === '/api/roster/set' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      const from = url.searchParams.get('from'), to = url.searchParams.get('to');
+      const cost = parseFloat(url.searchParams.get('cost') || '');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(from || '') || !/^\d{4}-\d{2}-\d{2}$/.test(to || '') || !isFinite(cost)) {
+        return json({ error: 'bad params', plain: 'Need from, to (YYYY-MM-DD) and a numeric cost.' }, 400);
+      }
+      const days = eachDate(from, to);
+      if (!days.length) return json({ error: 'bad range' }, 400);
+      const per = cost / days.length;
+      const rows = days.map((d) => ({ date: d, cost: per }));
+      const saved = await saveIngestedRows(env, 'rostering', rows);
+      await noteSync(env, 'rostering');
+      return json({ ok: true, from: from, to: to, cost: cost, days: saved, daily: Math.round(per * 100) / 100 });
+    }
+    if (path === '/api/roster/clear' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      const from = url.searchParams.get('from'), to = url.searchParams.get('to');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(from || '') || !/^\d{4}-\d{2}-\d{2}$/.test(to || '')) return json({ error: 'bad params' }, 400);
+      let cleared = 0;
+      for (const d of eachDate(from, to)) { await env.TOKENS.delete('data:rostering:' + d); cleared++; }
+      return json({ ok: true, cleared: cleared });
     }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
