@@ -1081,6 +1081,50 @@ export default {
       for (const d of eachDate(from, to)) { await env.TOKENS.delete('data:rostering:' + d); cleared++; }
       return json({ ok: true, cleared: cleared });
     }
+    if (path === '/api/debug/items' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      const days = Math.max(1, Math.min(31, parseInt(url.searchParams.get('days') || '7', 10) || 7));
+      const tz = 'Australia/Sydney';
+      const h = makeHelpers(env, 'pos');
+      try {
+        const locs = await ADAPTERS.pos._locations(env, h);
+        const ids = locs.map((l) => l.id);
+        const now = new Date();
+        const toYmd = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
+        const fromYmd = addDays(toYmd, -days + 1);
+        const startAt = localToUTC(tz, fromYmd, 0).toISOString();
+        const endAt = localToUTC(tz, addDays(toYmd, 1), 0).toISOString();
+        const byName = {}, byVariation = {}, cats = {};
+        let cursor = null, guard = 0, orders = 0, sample = null;
+        do {
+          const body = { location_ids: ids, limit: 500,
+            query: { filter: { date_time_filter: { created_at: { start_at: startAt, end_at: endAt } },
+              state_filter: { states: ['COMPLETED', 'OPEN'] } },
+              sort: { sort_field: 'CREATED_AT', sort_order: 'ASC' } } };
+          if (cursor) body.cursor = cursor;
+          const d = await h.fetchJson('https://connect.squareup.com/v2/orders/search',
+            { method: 'POST', headers: ADAPTERS.pos._headers(env), body: JSON.stringify(body) }, { auth: false });
+          for (const o of (d.orders || [])) {
+            orders++;
+            for (const li of (o.line_items || [])) {
+              const qty = parseFloat(li.quantity || '1') || 1;
+              const nm = li.name || '(unnamed)';
+              const vn = li.variation_name || '';
+              byName[nm] = (byName[nm] || 0) + qty;
+              const kv = vn ? (nm + ' — ' + vn) : nm;
+              byVariation[kv] = (byVariation[kv] || 0) + qty;
+              if (li.category_name) cats[li.category_name] = (cats[li.category_name] || 0) + qty;
+              if (!sample) sample = li;
+            }
+          }
+          cursor = d.cursor || null; guard++;
+        } while (cursor && guard < 12);
+        const top = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, 40).map(([k, v]) => ({ item: k, qty: Math.round(v * 100) / 100 }));
+        return json({ range: { from: fromYmd, to: toYmd }, orders_scanned: orders,
+          categories: top(cats), top_by_name: top(byName), top_by_variation: top(byVariation),
+          sample_line_item: sample });
+      } catch (e) { return json({ error: String(e && e.message) }, 500); }
+    }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
       if (!loggedIn) return Response.redirect(url.origin + '/', 302);
