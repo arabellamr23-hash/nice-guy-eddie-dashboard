@@ -140,6 +140,34 @@ function addDays(ymd, n) {
   return dt.toISOString().slice(0, 10);
 }
 
+/* Diagnostic count variants (used only by /api/debug/count). */
+async function dbgCountOrders(env, h, locId, startAt, endAt, dateField, states) {
+  let cursor = null, total = 0, guard = 0;
+  do {
+    const filter = { state_filter: { states: states } };
+    filter.date_time_filter = {}; filter.date_time_filter[dateField] = { start_at: startAt, end_at: endAt };
+    const body = { location_ids: [locId], limit: 500,
+      query: { filter, sort: { sort_field: dateField.toUpperCase(), sort_order: 'ASC' } } };
+    if (cursor) body.cursor = cursor;
+    const data = await h.fetchJson('https://connect.squareup.com/v2/orders/search',
+      { method: 'POST', headers: ADAPTERS.pos._headers(env), body: JSON.stringify(body) }, { auth: false });
+    total += (data.orders || []).length; cursor = data.cursor || null; guard++;
+  } while (cursor && guard < 400);
+  return total;
+}
+async function dbgCountPayments(env, h, locId, beginTime, endTime) {
+  let cursor = null, total = 0, guard = 0;
+  do {
+    let u = 'https://connect.squareup.com/v2/payments?begin_time=' + encodeURIComponent(beginTime)
+      + '&end_time=' + encodeURIComponent(endTime) + '&location_id=' + locId + '&limit=100&sort_order=ASC';
+    if (cursor) u += '&cursor=' + encodeURIComponent(cursor);
+    const data = await h.fetchJson(u, { headers: ADAPTERS.pos._headers(env) }, { auth: false });
+    total += (data.payments || []).filter((p) => p.status === 'COMPLETED').length;
+    cursor = data.cursor || null; guard++;
+  } while (cursor && guard < 800);
+  return total;
+}
+
 const ADAPTERS = {
 
   /* >>> ADAPTER 1: ACCOUNTING (connect this FIRST - it feeds most of the board)
@@ -1024,6 +1052,30 @@ export default {
         }
       } catch (e) { result.square_error = String(e && e.message); }
       return json(result);
+    }
+    if (path === '/api/debug/count' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      const from = url.searchParams.get('from') || '2026-06-01';
+      const to = url.searchParams.get('to') || '2026-06-30';
+      const h = makeHelpers(env, 'pos');
+      try {
+        const data = await h.fetchJson('https://connect.squareup.com/v2/locations',
+          { headers: ADAPTERS.pos._headers(env) }, { auth: false });
+        const active = (data.locations || []).find((l) => l.status === 'ACTIVE') || (data.locations || [])[0];
+        const loc = active.id; const locTz = active.timezone || 'Australia/Sydney';
+        const startSyd = localToUTC('Australia/Sydney', from, 0).toISOString();
+        const endSyd = localToUTC('Australia/Sydney', addDays(to, 1), 0).toISOString();
+        const startLoc = localToUTC(locTz, from, 0).toISOString();
+        const endLoc = localToUTC(locTz, addDays(to, 1), 0).toISOString();
+        const out = { location: active.name, locId: loc, locTz: locTz };
+        out.created_completed_syd = await dbgCountOrders(env, h, loc, startSyd, endSyd, 'created_at', ['COMPLETED']);
+        out.created_completed_loc = await dbgCountOrders(env, h, loc, startLoc, endLoc, 'created_at', ['COMPLETED']);
+        out.closed_completed_loc  = await dbgCountOrders(env, h, loc, startLoc, endLoc, 'closed_at', ['COMPLETED']);
+        out.created_completed_open_loc = await dbgCountOrders(env, h, loc, startLoc, endLoc, 'created_at', ['COMPLETED', 'OPEN']);
+        try { out.payments_completed_loc = await dbgCountPayments(env, h, loc, startLoc, endLoc); }
+        catch (e) { out.payments_error = String(e && e.message); }
+        return json(out);
+      } catch (e) { return json({ error: String(e && e.message) }, 500); }
     }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
